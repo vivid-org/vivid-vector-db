@@ -1,25 +1,26 @@
 //! # Vivid Python Bindings
 //!
-//! Exposes the high-performance Rust FlatIndex to the Python ecosystem using PyO3.
+//! Exposes the high-performance Rust HNSW index to the Python ecosystem using PyO3.
+
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use vivid_index::FlatIndex;
+use vivid_index::HnswIndex;
 
-/// High-performance Vector Index written in Rust.
+/// High-performance Approximate Nearest Neighbor Search (HNSW) index backed by Rust.
 #[pyclass]
-struct PyFlatIndex {
-    inner: FlatIndex,
+struct PyVividIndex {
+    inner: HnswIndex,
 }
 
 #[pymethods]
-impl PyFlatIndex {
-    /// Creates a new FlatIndex instance from Python.
+impl PyVividIndex {
+    /// Creates a new PyVividIndex instance from Python.
     ///
-    /// Example: `index = vivid.PyFlatIndex(3)`
+    /// Example: `index = vivid.PyVividIndex(3)`
     #[new]
     fn new(dimension: usize) -> Self {
         Self {
-            inner: FlatIndex::new(dimension),
+            inner: HnswIndex::new(dimension),
         }
     }
 
@@ -33,15 +34,11 @@ impl PyFlatIndex {
 
     /// Searches for the top_k nearest neighbors of the query vector.
     /// Returns a list of dictionaries with 'id' and 'score'.
-    /// 
-    /// Passing `py: Python` as the first parameter is the idiomatic,
-    /// safe way to acquire the GIL without `unsafe` blocks.
     fn search(&self, py: Python<'_>, query: Vec<f32>, top_k: usize) -> PyResult<Vec<PyObject>> {
         let hits = self.inner
             .search(&query, top_k)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
-        // Convert Rust structures into native Python dictionaries safely
         let mut py_results = Vec::with_capacity(hits.len());
         for hit in hits {
             let dict = pyo3::types::PyDict::new_bound(py);
@@ -63,7 +60,7 @@ impl PyFlatIndex {
     /// Loads the index from a binary file.
     #[staticmethod]
     fn load_from_file(path: String) -> PyResult<Self> {
-        let index = FlatIndex::load_from_file(path)
+        let index = HnswIndex::load_from_file(path)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(Self { inner: index })
     }
@@ -74,9 +71,8 @@ impl PyFlatIndex {
     }
 }
 
-/// Core module definition for Python.
 #[pymodule]
 fn vivid(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<PyFlatIndex>()?;
+    m.add_class::<PyVividIndex>()?;
     Ok(())
 }

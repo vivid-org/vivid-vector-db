@@ -6,8 +6,10 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
+use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 
+use bytemuck::cast_slice;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use vivid_core::{CosineSpace, VectorError, VectorSpace};
@@ -18,11 +20,17 @@ const DEFAULT_M: usize = 16;
 const DEFAULT_M_MAX: usize = 32;
 const DEFAULT_EF_CONSTRUCTION: usize = 200;
 
+const VIDH_MAGIC: [u8; 4] = *b"VIDH";
+
+const fn align_up(n: usize, align: usize) -> usize {
+    (n + align - 1) & !(align - 1)
+}
+
 /// A candidate node with its distance to a query vector.
 #[derive(Clone, Debug)]
-struct Candidate {
-    node_id: usize,
-    distance: f32,
+pub(crate) struct Candidate {
+    pub(crate) node_id: usize,
+    pub(crate) distance: f32,
 }
 
 impl PartialEq for Candidate {
@@ -47,31 +55,44 @@ impl Ord for Candidate {
     }
 }
 
+/// Serializable portion of the HNSW index (graph topology, metadata, IDs).
+#[derive(Serialize, Deserialize)]
+struct GraphData {
+    dimension: usize,
+    m: usize,
+    m_max: usize,
+    ef_construction: usize,
+    ml: f32,
+    ids: Vec<VectorId>,
+    levels: Vec<usize>,
+    adjacency: Vec<Vec<Vec<usize>>>,
+    max_layer: usize,
+    entry_point: Option<usize>,
+}
+
 /// HNSW (Hierarchical Navigable Small World) graph index.
 ///
-/// Provides approximate nearest neighbor search with logarithmic time complexity,
-/// replacing the brute-force O(n) FlatIndex for large-scale vector search.
+/// Provides approximate nearest neighbor search with logarithmic time complexity.
+///
+/// Vectors are stored as raw `f32` bytes in a `Vec<u8>` for zero-copy access via
+/// `bytemuck`. The file format combines a bincode-encoded graph section with raw
+/// vector data, matching the on-disk layout of the mmap-backed index.
 ///
 /// # Parameters
 /// - `m`: Maximum number of connections per element per layer (default: 16)
 /// - `m_max`: Maximum number of connections for the bottom layer (default: 32)
 /// - `ef_construction`: Size of the dynamic candidate list during construction (default: 200)
-#[derive(Serialize, Deserialize)]
 pub struct HnswIndex {
     dimension: usize,
     m: usize,
     m_max: usize,
     ef_construction: usize,
     ml: f32,
-    vectors: Vec<Vec<f32>>,
+    vector_data: Vec<u8>,
     ids: Vec<VectorId>,
-    /// adjacency[layer][node_id] = list of neighbor node_ids
     adjacency: Vec<Vec<Vec<usize>>>,
-    /// The highest layer each node belongs to
     levels: Vec<usize>,
-    /// Current top-most layer in the graph
     max_layer: usize,
-    /// Entry point node ID for search traversal
     entry_point: Option<usize>,
 }
 
@@ -96,7 +117,7 @@ impl HnswIndex {
             m_max,
             ef_construction,
             ml: 1.0 / (m as f32).ln(),
-            vectors: Vec::new(),
+            vector_data: Vec::new(),
             ids: Vec::new(),
             adjacency: Vec::new(),
             levels: Vec::new(),
@@ -105,12 +126,42 @@ impl HnswIndex {
         }
     }
 
+    /// Returns the i-th vector as a slice.
+    #[inline]
+    fn vector_at(&self, index: usize) -> &[f32] {
+        let start = index * self.dimension;
+        let bytes = &self.vector_data[start * 4..(start + self.dimension) * 4];
+        cast_slice(bytes)
+    }
+
+    /// Returns the internal node index for a given external ID.
+    fn node_id_by_id(&self, id: VectorId) -> Option<usize> {
+        self.ids.iter().position(|&x| x == id)
+    }
+
+    /// Returns `true` if the index contains the given ID.
+    #[must_use]
+    pub fn contains(&self, id: VectorId) -> bool {
+        self.node_id_by_id(id).is_some()
+    }
+
+    /// Retrieves the vector associated with the given ID, if it exists.
+    #[must_use]
+    pub fn get(&self, id: VectorId) -> Option<&[f32]> {
+        let pos = self.node_id_by_id(id)?;
+        Some(self.vector_at(pos))
+    }
+
     /// Inserts a vector into the index with a specific ID.
     ///
     /// # Errors
     ///
+    /// Returns [`IndexError::DuplicateId`] if the ID already exists.
     /// Returns [`IndexError::DimensionMismatch`] if the vector length is invalid.
     pub fn insert(&mut self, id: VectorId, vector: Vec<f32>) -> Result<(), IndexError> {
+        if self.contains(id) {
+            return Err(IndexError::DuplicateId(id));
+        }
         if vector.is_empty() {
             return Err(IndexError::EmptyVector);
         }
@@ -122,9 +173,10 @@ impl HnswIndex {
         }
 
         let new_level = self.random_level();
-        let node_id = self.vectors.len();
+        let node_id = self.ids.len();
 
-        self.vectors.push(vector);
+        let vec_bytes: &[u8] = cast_slice(vector.as_slice());
+        self.vector_data.extend_from_slice(vec_bytes);
         self.ids.push(id);
         self.levels.push(new_level);
 
@@ -133,8 +185,8 @@ impl HnswIndex {
         }
 
         while self.adjacency.len() <= new_level {
-            let mut layer = Vec::with_capacity(self.vectors.len());
-            for _ in 0..self.vectors.len() {
+            let mut layer = Vec::with_capacity(self.ids.len());
+            for _ in 0..self.ids.len() {
                 layer.push(Vec::new());
             }
             self.adjacency.push(layer);
@@ -146,12 +198,12 @@ impl HnswIndex {
             return Ok(());
         }
 
-        let query = &self.vectors[node_id];
+        let owned_query = self.vector_at(node_id).to_vec();
         let mut curr_entry = self.entry_point.unwrap();
 
         for level in (new_level + 1..=self.max_layer).rev() {
             let candidates = self
-                .search_layer(query, &[curr_entry], level, 1)
+                .search_layer(&owned_query, &[curr_entry], level, 1)
                 .expect("search_layer should not fail with valid vectors");
             curr_entry = candidates[0].node_id;
         }
@@ -159,7 +211,7 @@ impl HnswIndex {
         let top_layer = new_level.min(self.max_layer);
         for level in (0..=top_layer).rev() {
             let candidates = self
-                .search_layer(query, &[curr_entry], level, self.ef_construction)
+                .search_layer(&owned_query, &[curr_entry], level, self.ef_construction)
                 .expect("search_layer should not fail with valid vectors");
 
             let m_curr = if level == 0 { self.m_max } else { self.m };
@@ -177,22 +229,17 @@ impl HnswIndex {
                 let limit = if level == 0 { self.m_max } else { self.m };
                 if self.adjacency[level][neighbor].len() > limit {
                     let new_adj = {
-                        let node_vec = &self.vectors[neighbor];
+                        let node_vec = self.vector_at(neighbor);
                         let mut cand: Vec<Candidate> = self.adjacency[level][neighbor]
                             .iter()
                             .map(|&n| {
-                                let dist = CosineSpace::distance(node_vec, &self.vectors[n])
+                                let dist = CosineSpace::distance(node_vec, self.vector_at(n))
                                     .expect("vectors share the same dimension");
-                                Candidate {
-                                    node_id: n,
-                                    distance: dist,
-                                }
+                                Candidate { node_id: n, distance: dist }
                             })
                             .collect();
                         cand.sort_unstable_by(|a, b| {
-                            a.distance
-                                .partial_cmp(&b.distance)
-                                .unwrap_or(std::cmp::Ordering::Equal)
+                            a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal)
                         });
                         cand.truncate(limit);
                         cand.into_iter().map(|c| c.node_id).collect::<Vec<_>>()
@@ -212,18 +259,102 @@ impl HnswIndex {
         Ok(())
     }
 
-    /// Searches for the top-K nearest neighbors of the query vector using the HNSW algorithm.
+    /// Inserts multiple vectors in batch, pre-allocating storage to minimise reallocations.
+    ///
+    /// Each batch call still builds the graph incrementally and honors uniqueness:
+    /// if any ID in the batch already exists, the entire batch is rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError::DuplicateId`] if any ID already exists.
+    /// Returns [`IndexError::DimensionMismatch`] if any vector length is invalid.
+    pub fn insert_batch(&mut self, items: &[(VectorId, Vec<f32>)]) -> Result<(), IndexError> {
+        for (id, _) in items {
+            if self.contains(*id) {
+                return Err(IndexError::DuplicateId(*id));
+            }
+        }
+
+        self.vector_data.reserve(items.len() * self.dimension * 4);
+        self.ids.reserve(items.len());
+        self.levels.reserve(items.len());
+
+        for (id, vector) in items {
+            self.insert(*id, vector.clone())?;
+        }
+        Ok(())
+    }
+
+    /// Removes a vector from the index by its ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError::IdNotFound`] if the ID is not present.
+    pub fn remove(&mut self, id: VectorId) -> Result<(), IndexError> {
+        let pos = self.node_id_by_id(id).ok_or(IndexError::IdNotFound(id))?;
+
+        self.ids.remove(pos);
+
+        let byte_start = pos * self.dimension * 4;
+        self.vector_data.drain(byte_start..byte_start + self.dimension * 4);
+
+        self.levels.remove(pos);
+
+        for layer in &mut self.adjacency {
+            layer.remove(pos);
+            for neighbors in layer.iter_mut() {
+                neighbors.retain(|&n| n != pos);
+                for n in neighbors.iter_mut() {
+                    if *n > pos {
+                        *n -= 1;
+                    }
+                }
+            }
+        }
+
+        self.fix_entry_point_after_removal(pos);
+
+        Ok(())
+    }
+
+    /// Replaces the vector for an existing ID (delete + re-insert).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError::IdNotFound`] if the ID is not present.
+    pub fn update(&mut self, id: VectorId, vector: Vec<f32>) -> Result<(), IndexError> {
+        self.remove(id)?;
+        self.insert(id, vector)
+    }
+
+    fn fix_entry_point_after_removal(&mut self, removed_pos: usize) {
+        if self.ids.is_empty() {
+            self.entry_point = None;
+            self.max_layer = 0;
+            return;
+        }
+
+        if let Some(ep) = self.entry_point {
+            if ep == removed_pos {
+                self.entry_point = Some(0);
+                self.max_layer = *self.levels.iter().max().unwrap_or(&0);
+            } else if ep > removed_pos {
+                self.entry_point = Some(ep - 1);
+            }
+        }
+    }
+
+    /// Searches for the top-K nearest neighbours using the HNSW algorithm.
     ///
     /// # Errors
     ///
     /// Returns [`VectorError::EmptyVector`] if the query vector is empty.
     pub fn search(&self, query: &[f32], top_k: usize) -> Result<Vec<SearchResult>, VectorError> {
-        if self.vectors.is_empty() {
+        if self.ids.is_empty() {
             return Ok(Vec::new());
         }
 
         let ef = top_k.max(100);
-
         let mut curr_entry = self.entry_point.unwrap();
 
         for level in (1..=self.max_layer).rev() {
@@ -243,8 +374,7 @@ impl HnswIndex {
             .collect())
     }
 
-    /// Searches a single layer of the graph for the `ef` nearest neighbors to `query`,
-    /// starting from the given entry points.
+    /// Searches a single layer for the `ef` nearest neighbours starting from `entry_points`.
     fn search_layer(
         &self,
         query: &[f32],
@@ -257,44 +387,31 @@ impl HnswIndex {
         let mut result = BinaryHeap::new();
 
         for &ep in entry_points {
-            let dist = CosineSpace::distance(query, &self.vectors[ep])?;
-            let cand = Candidate {
-                node_id: ep,
-                distance: dist,
-            };
+            let dist = CosineSpace::distance(query, self.vector_at(ep))?;
+            let cand = Candidate { node_id: ep, distance: dist };
             candidates.push(Reverse(cand.clone()));
             result.push(cand);
             visited.insert(ep);
         }
 
         while let Some(Reverse(c)) = candidates.pop() {
-            let furthest = result
-                .peek()
-                .ok_or(VectorError::EmptyVector)?;
+            let furthest = result.peek().ok_or(VectorError::EmptyVector)?;
             if c.distance > furthest.distance {
                 break;
             }
 
             for &neighbor in &self.adjacency[layer][c.node_id] {
                 if visited.insert(neighbor) {
-                    let dist = CosineSpace::distance(query, &self.vectors[neighbor])?;
+                    let dist = CosineSpace::distance(query, self.vector_at(neighbor))?;
 
                     if result.len() < ef {
-                        let cand = Candidate {
-                            node_id: neighbor,
-                            distance: dist,
-                        };
+                        let cand = Candidate { node_id: neighbor, distance: dist };
                         candidates.push(Reverse(cand.clone()));
                         result.push(cand);
                     } else {
-                        let furthest = result
-                            .peek()
-                            .ok_or(VectorError::EmptyVector)?;
+                        let furthest = result.peek().ok_or(VectorError::EmptyVector)?;
                         if dist < furthest.distance {
-                            let cand = Candidate {
-                                node_id: neighbor,
-                                distance: dist,
-                            };
+                            let cand = Candidate { node_id: neighbor, distance: dist };
                             candidates.push(Reverse(cand.clone()));
                             result.push(cand);
                             result.pop();
@@ -307,45 +424,113 @@ impl HnswIndex {
         Ok(result.into_sorted_vec())
     }
 
-    /// Selects the `m` nearest neighbors from a sorted candidate list.
     fn select_neighbors_simple(candidates: &[Candidate], m: usize) -> Vec<usize> {
         candidates.iter().take(m).map(|c| c.node_id).collect()
     }
 
-    /// Generates a random level for a new node based on the normalization factor `ml`.
     fn random_level(&self) -> usize {
         let mut rng = rand::thread_rng();
         let r: f64 = rng.gen_range(f64::MIN_POSITIVE..1.0);
         (-r.ln() * self.ml as f64).floor() as usize
     }
 
-    /// Saves the current index state to a binary file on disk.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`IndexError::Io`] or [`IndexError::Serialization`] if storage fails.
+    /// Saves the index to a binary file in the combined VIDH format
+    /// (bincode graph + padding + raw `f32` vectors).
     pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), IndexError> {
-        let file = std::fs::File::create(path.as_ref())?;
-        let writer = std::io::BufWriter::new(file);
-        bincode::serialize_into(writer, self)
+        let graph = GraphData {
+            dimension: self.dimension,
+            m: self.m,
+            m_max: self.m_max,
+            ef_construction: self.ef_construction,
+            ml: self.ml,
+            ids: self.ids.clone(),
+            levels: self.levels.clone(),
+            adjacency: self.adjacency.clone(),
+            max_layer: self.max_layer,
+            entry_point: self.entry_point,
+        };
+
+        let graph_bytes = bincode::serialize(&graph)
             .map_err(|e| IndexError::Serialization(e.to_string()))?;
+
+        let raw_end = 12 + graph_bytes.len();
+        let aligned_start = align_up(raw_end, 4);
+        let padding = aligned_start - raw_end;
+
+        let file = std::fs::File::create(path.as_ref())?;
+        let mut writer = BufWriter::new(file);
+
+        writer.write_all(&VIDH_MAGIC)?;
+        writer.write_all(&(graph_bytes.len() as u64).to_le_bytes())?;
+        writer.write_all(&graph_bytes)?;
+
+        for _ in 0..padding {
+            writer.write_all(&[0])?;
+        }
+
+        writer.write_all(&self.vector_data)?;
+        writer.flush()?;
         Ok(())
     }
 
-    /// Loads the index state from a binary file on disk.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the file does not exist, is corrupted, or has an invalid format.
+    /// Loads the index from a binary file created by [`save_to_file`](Self::save_to_file)
+    /// (VIDH combined format).
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, IndexError> {
-        let file = std::fs::File::open(path.as_ref())?;
-        let reader = std::io::BufReader::new(file);
-        let index = bincode::deserialize_from(reader)
+        let mut file = std::fs::File::open(path.as_ref())?;
+        let file_size = file.metadata()?.len() as usize;
+
+        let mut data = Vec::with_capacity(file_size);
+        file.read_to_end(&mut data)?;
+
+        if data.len() < 12 {
+            return Err(IndexError::Serialization("file too small for header".into()));
+        }
+
+        if data[0..4] != VIDH_MAGIC {
+            return Err(IndexError::Serialization("invalid magic bytes".into()));
+        }
+
+        let gs_bytes: [u8; 8] = data[4..12].try_into().unwrap();
+        let graph_size = u64::from_le_bytes(gs_bytes) as usize;
+
+        let graph_end = 12 + graph_size;
+        if data.len() < graph_end {
+            return Err(IndexError::Serialization("file too small for graph data".into()));
+        }
+
+        let graph: GraphData = bincode::deserialize(&data[12..graph_end])
             .map_err(|e| IndexError::Serialization(e.to_string()))?;
-        Ok(index)
+
+        let vector_data_start = align_up(graph_end, 4);
+        let expected_vec_bytes = graph.ids.len() * graph.dimension * 4;
+        if data.len() < vector_data_start + expected_vec_bytes {
+            return Err(IndexError::Serialization("file too small for vector data".into()));
+        }
+
+        let vector_data = data[vector_data_start..vector_data_start + expected_vec_bytes].to_vec();
+
+        Ok(Self {
+            dimension: graph.dimension,
+            m: graph.m,
+            m_max: graph.m_max,
+            ef_construction: graph.ef_construction,
+            ml: graph.ml,
+            vector_data,
+            ids: graph.ids,
+            levels: graph.levels,
+            adjacency: graph.adjacency,
+            max_layer: graph.max_layer,
+            entry_point: graph.entry_point,
+        })
     }
 
-    /// Returns the current total number of indexed vectors.
+    /// Returns the vector dimension of the index.
+    #[must_use]
+    pub fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    /// Returns the total number of indexed vectors.
     #[must_use]
     pub fn len(&self) -> usize {
         self.ids.len()
@@ -371,7 +556,6 @@ mod tests {
 
         let query = [0.9, 0.1, 0.0];
         let hits = index.search(&query, 2).unwrap();
-
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].id, 101);
     }
@@ -398,75 +582,175 @@ mod tests {
     }
 
     #[test]
-    fn test_hnsw_insert_duplicate_id() {
-        let mut index = HnswIndex::with_params(2, 8, 16, 100);
-        index.insert(1, vec![0.0, 0.0]).unwrap();
-        index.insert(1, vec![1.0, 1.0]).unwrap();
-        assert_eq!(index.len(), 2);
-    }
-
-    #[test]
     fn test_hnsw_accuracy_against_flat() {
-        use crate::FlatIndex;
+        let dir = std::env::temp_dir();
+        let path = dir.join("vivid_hnsw_acc_test.bin");
 
         let dim = 32;
         let n = 200;
         let top_k = 5;
 
         let mut hnsw = HnswIndex::with_params(dim, 16, 32, 200);
-        let mut flat = FlatIndex::new(dim);
 
         let mut rng = rand::thread_rng();
-        let mut queries = Vec::new();
+        let mut flat_ids = Vec::new();
+        let mut flat_vectors = Vec::new();
 
         for i in 0..n {
             let vec: Vec<f32> = (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect();
             hnsw.insert(i as u64, vec.clone()).unwrap();
-            flat.insert(i as u64, vec).unwrap();
+            flat_ids.push(i as u64);
+            flat_vectors.push(vec);
         }
 
+        let flat = crate::FlatIndex::create(&path, dim, &flat_ids, &flat_vectors).unwrap();
+
+        let mut total_recall = 0.0f64;
         for _ in 0..20 {
             let query: Vec<f32> = (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect();
-            queries.push(query);
-        }
-
-        let mut total_recall = 0.0;
-        for query in &queries {
-            let hnsw_hits = hnsw.search(query, top_k).unwrap();
-            let flat_hits = flat.search(query, top_k).unwrap();
+            let hnsw_hits = hnsw.search(&query, top_k).unwrap();
+            let flat_hits = flat.search(&query, top_k).unwrap();
 
             let hnsw_ids: Vec<u64> = hnsw_hits.iter().map(|h| h.id).collect();
             let flat_ids: Vec<u64> = flat_hits.iter().map(|h| h.id).collect();
 
             let overlap = hnsw_ids.iter().filter(|id| flat_ids.contains(id)).count();
-            let recall = overlap as f64 / top_k as f64;
-            total_recall += recall;
+            total_recall += overlap as f64 / top_k as f64;
         }
 
-        let avg_recall = total_recall / queries.len() as f64;
+        let avg_recall = total_recall / 20.0;
         assert!(avg_recall > 0.90, "HNSW recall too low: {avg_recall:.3}");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn test_hnsw_persistence() {
-        let temp_dir = std::env::temp_dir();
-        let file_path = temp_dir.join("vivid_hnsw_test.bin");
+        let dir = std::env::temp_dir();
+        let path = dir.join("vivid_hnsw_persist.bin");
 
         let mut original = HnswIndex::with_params(3, 8, 16, 100);
         original.insert(42, vec![0.1, 0.9, 0.0]).unwrap();
         original.insert(99, vec![0.8, 0.2, 0.0]).unwrap();
 
-        original.save_to_file(&file_path).unwrap();
-        let loaded = HnswIndex::load_from_file(&file_path).unwrap();
+        original.save_to_file(&path).unwrap();
+        let loaded = HnswIndex::load_from_file(&path).unwrap();
 
         assert_eq!(loaded.len(), original.len());
 
         let query = [0.15, 0.85, 0.0];
         let original_hits = original.search(&query, 1).unwrap();
         let loaded_hits = loaded.search(&query, 1).unwrap();
-
         assert_eq!(original_hits[0].id, loaded_hits[0].id);
 
-        let _ = std::fs::remove_file(file_path);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_duplicate_id_rejected() {
+        let mut index = HnswIndex::new(3);
+        index.insert(1, vec![0.1, 0.2, 0.3]).unwrap();
+        let err = index.insert(1, vec![0.4, 0.5, 0.6]).unwrap_err();
+        assert!(matches!(err, IndexError::DuplicateId(1)));
+    }
+
+    #[test]
+    fn test_get_vector_by_id() {
+        let mut index = HnswIndex::new(3);
+        index.insert(42, vec![0.1, 0.2, 0.3]).unwrap();
+        let v = index.get(42);
+        assert!(v.is_some());
+        assert!((v.unwrap()[0] - 0.1).abs() < 1e-6);
+        assert!(index.get(99).is_none());
+    }
+
+    #[test]
+    fn test_remove_vector() {
+        let mut index = HnswIndex::with_params(3, 8, 16, 100);
+        index.insert(10, vec![1.0, 0.0, 0.0]).unwrap();
+        index.insert(20, vec![0.0, 1.0, 0.0]).unwrap();
+        index.insert(30, vec![0.0, 0.0, 1.0]).unwrap();
+
+        assert_eq!(index.len(), 3);
+        index.remove(20).unwrap();
+        assert_eq!(index.len(), 2);
+        assert!(index.get(20).is_none());
+        assert!(index.get(10).is_some());
+        assert!(index.get(30).is_some());
+
+        let hits = index.search(&[0.0, 1.0, 0.0], 2).unwrap();
+        assert!(hits.iter().any(|r| r.id == 10 || r.id == 30));
+    }
+
+    #[test]
+    fn test_remove_nonexistent() {
+        let mut index = HnswIndex::new(3);
+        index.insert(1, vec![0.1, 0.2, 0.3]).unwrap();
+        let err = index.remove(99).unwrap_err();
+        assert!(matches!(err, IndexError::IdNotFound(99)));
+    }
+
+    #[test]
+    fn test_update_vector() {
+        let mut index = HnswIndex::with_params(2, 8, 16, 100);
+        index.insert(1, vec![0.0, 1.0]).unwrap();
+        index.update(1, vec![1.0, 0.0]).unwrap();
+
+        let hits = index.search(&[1.0, 0.0], 1).unwrap();
+        assert_eq!(hits[0].id, 1);
+        assert!(hits[0].score < 0.001);
+    }
+
+    #[test]
+    fn test_update_nonexistent() {
+        let mut index = HnswIndex::new(2);
+        let err = index.update(99, vec![0.1, 0.2]).unwrap_err();
+        assert!(matches!(err, IndexError::IdNotFound(99)));
+    }
+
+    #[test]
+    fn test_insert_batch() {
+        let mut index = HnswIndex::with_params(3, 8, 16, 100);
+        let items = vec![
+            (10, vec![1.0, 0.0, 0.0]),
+            (20, vec![0.0, 1.0, 0.0]),
+            (30, vec![0.0, 0.0, 1.0]),
+        ];
+        index.insert_batch(&items).unwrap();
+        assert_eq!(index.len(), 3);
+
+        let hits = index.search(&[1.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(hits[0].id, 10);
+    }
+
+    #[test]
+    fn test_insert_batch_duplicate_rejected() {
+        let mut index = HnswIndex::new(3);
+        index.insert(10, vec![1.0, 0.0, 0.0]).unwrap();
+
+        let items = vec![
+            (20, vec![0.0, 1.0, 0.0]),
+            (10, vec![0.0, 0.0, 1.0]),
+        ];
+        let err = index.insert_batch(&items).unwrap_err();
+        assert!(matches!(err, IndexError::DuplicateId(10)));
+        assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn test_contains() {
+        let mut index = HnswIndex::new(2);
+        assert!(!index.contains(42));
+        index.insert(42, vec![0.1, 0.2]).unwrap();
+        assert!(index.contains(42));
+    }
+
+    #[test]
+    fn test_remove_last_vector() {
+        let mut index = HnswIndex::new(2);
+        index.insert(1, vec![0.1, 0.2]).unwrap();
+        index.remove(1).unwrap();
+        assert!(index.is_empty());
+        assert!(index.search(&[0.1, 0.2], 5).unwrap().is_empty());
     }
 }

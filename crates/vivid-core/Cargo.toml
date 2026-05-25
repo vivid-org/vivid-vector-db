@@ -10,6 +10,8 @@ thiserror = { workspace = true }
 
 [features]
 nightly = []
+simd-lanes-16 = ["nightly"]
+simd-lanes-4 = ["nightly"]
 
 [[bench]]
 name = "vector_bench"

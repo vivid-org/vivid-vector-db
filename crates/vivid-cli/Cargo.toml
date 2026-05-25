@@ -13,3 +13,5 @@ serde_json = "1.0.150"
 
 [features]
 nightly = ["vivid-core/nightly", "vivid-index/nightly"]
+simd-lanes-16 = ["vivid-core/simd-lanes-16", "vivid-index/simd-lanes-16"]
+simd-lanes-4 = ["vivid-core/simd-lanes-4", "vivid-index/simd-lanes-4"]

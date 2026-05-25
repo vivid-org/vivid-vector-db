@@ -4,7 +4,33 @@
 use std::simd::num::SimdFloat;
 use std::simd::Simd;
 
-const LANES: usize = 8;
+/// Override lane width to 16 (suitable for AVX-512 targets).
+#[cfg(feature = "simd-lanes-16")]
+const LANES: usize = 16;
+
+/// Override lane width to 4 (suitable for SSE-only targets).
+#[cfg(feature = "simd-lanes-4")]
+const LANES: usize = 4;
+
+/// Auto-detect lane width from target features.
+///
+/// - 16 on AVX-512 targets
+/// - 8  on AVX/AVX2 targets
+/// - 4  on SSE-only targets (default fallback)
+#[cfg(not(any(feature = "simd-lanes-16", feature = "simd-lanes-4")))]
+mod lanes {
+    #[cfg(target_feature = "avx512f")]
+    pub const LANES: usize = 16;
+
+    #[cfg(all(not(target_feature = "avx512f"), target_feature = "avx"))]
+    pub const LANES: usize = 8;
+
+    #[cfg(not(any(target_feature = "avx512f", target_feature = "avx")))]
+    pub const LANES: usize = 4;
+}
+
+#[cfg(not(any(feature = "simd-lanes-16", feature = "simd-lanes-4")))]
+use lanes::LANES;
 
 /// Computes L2 (Euclidean) distance using manual SIMD instructions.
 pub fn l2_distance_simd(a: &[f32], b: &[f32]) -> f32 {
@@ -44,10 +70,8 @@ pub fn cosine_distance_simd(a: &[f32], b: &[f32]) -> f32 {
     let len = a.len();
     let len_rounded = len - (len % LANES);
 
-    // Main loop for SIMD lanes
     let mut i = 0;
     while i < len_rounded {
-        // Load chunks safely using slice references
         let va = Simd::from_slice(&a[i..i + LANES]);
         let vb = Simd::from_slice(&b[i..i + LANES]);
 
@@ -58,12 +82,10 @@ pub fn cosine_distance_simd(a: &[f32], b: &[f32]) -> f32 {
         i += LANES;
     }
 
-    // Horizontal reduction
     let mut dot = dot_sum.reduce_sum();
     let mut norm_a = norm_a_sum.reduce_sum();
     let mut norm_b = norm_b_sum.reduce_sum();
 
-    // Process the tail (remainder) sequentially
     while i < len {
         dot += a[i] * b[i];
         norm_a += a[i] * a[i];

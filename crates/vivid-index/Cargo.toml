@@ -11,6 +11,9 @@ serde = { workspace = true }
 rayon = "1.12.0"
 bincode = "1.3"
 rand = "0.8"
+bytemuck = "1"
 
 [features]
 nightly = ["vivid-core/nightly"]
+simd-lanes-16 = ["vivid-core/simd-lanes-16"]
+simd-lanes-4 = ["vivid-core/simd-lanes-4"]

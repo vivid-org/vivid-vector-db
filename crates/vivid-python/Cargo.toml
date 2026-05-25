@@ -14,3 +14,5 @@ pyo3 = { version = "0.21", features = ["extension-module"] }
 
 [features]
 nightly = ["vivid-index/nightly"]
+simd-lanes-16 = ["vivid-index/simd-lanes-16"]
+simd-lanes-4 = ["vivid-index/simd-lanes-4"]
