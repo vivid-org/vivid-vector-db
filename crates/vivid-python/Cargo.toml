@@ -1,0 +1,16 @@
+[package]
+name = "vivid-python"
+version = "0.1.0"
+edition = "2024"
+description = "Python bindings for Vivid Vector Database"
+
+[lib]
+name = "vivid"
+crate-type = ["cdylib"]
+
+[dependencies]
+vivid-index = { path = "../vivid-index" }
+pyo3 = { version = "0.21", features = ["extension-module"] }
+
+[features]
+nightly = ["vivid-index/nightly"]

@@ -1,0 +1,9 @@
+[workspace]
+resolver = "3"
+members = ["crates/vivid-cli","crates/vivid-core", "crates/vivid-index", "crates/vivid-python"]
+
+
+[workspace.dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+tokio = { version = "1.52.3", features = ["full"] }
+thiserror = "2.0.18"

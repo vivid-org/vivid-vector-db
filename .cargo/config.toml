@@ -1,0 +1,10 @@
+[target.'cfg(all())']
+rustflags = [
+    "-D", "unsafe_code",
+    "-D", "clippy::all",
+    "-D", "clippy::pedantic",
+    "-D", "missing_docs",
+]
+
+[build]
+rustflags = ["-C", "target-cpu=native"]

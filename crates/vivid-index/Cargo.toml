@@ -1,0 +1,16 @@
+[package]
+name = "vivid-index"
+version = "0.1.0"
+edition = "2024"
+description = "Vector indexing and search algorithms for Vivid"
+
+[dependencies]
+vivid-core = { path = "../vivid-core" }
+thiserror = { workspace = true }
+serde = { workspace = true }
+rayon = "1.12.0"
+bincode = "1.3"
+rand = "0.8"
+
+[features]
+nightly = ["vivid-core/nightly"]

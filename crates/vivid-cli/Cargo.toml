@@ -1,0 +1,15 @@
+[package]
+name = "vivid-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Command Line Interface for Vivid Vector Database"
+
+[dependencies]
+clap = { version = "4.6.1", features = ["derive"] }
+vivid-core = { path = "../vivid-core" }
+vivid-index = { path = "../vivid-index" }
+tokio = { workspace = true }
+serde_json = "1.0.150"
+
+[features]
+nightly = ["vivid-core/nightly", "vivid-index/nightly"]
