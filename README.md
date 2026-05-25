@@ -19,13 +19,17 @@ The project is a Cargo workspace of 4 decoupled crates:
 - **Dual-index architecture** — File-backed exact brute-force (`FlatIndex`), or incremental approximate logarithmic (`HnswIndex`)
 - **Multithreaded search** — Rayon-powered parallelism across all CPU cores
 - **Binary persistence** — Combined file format (bincode graph + raw `f32` vectors) with zero-copy access via `bytemuck`
-- **100% safe Rust** — `#![forbid(unsafe_code)]`, no `unsafe` blocks anywhere
+- **100% safe Rust** — `#![forbid(unsafe_code)]`, no `unsafe` blocks anywhere, verified by Clippy pedantic
+- **Criterion benchmarks** — Full benchmark suite for distance metrics (stable + nightly SIMD) and index operations (insert, search, update, batch insert, FlatIndex search)
 - **Nightly/Stable dual build** — Optional `nightly` feature flag enables manual SIMD; stable builds use idiomatic iterators
 - **Python bindings** — Native PyO3 extension module, installable via `maturin`
 - **Duplicate ID detection** — `insert()` rejects duplicate IDs with `IndexError::DuplicateId`
 - **Vector deletion / update** — `remove(id)` and `update(id, new_vector)` for live index mutation
 - **ID lookup** — `get(id) -> Option<&[f32]>` for zero-copy vector retrieval
 - **Bulk insert** — `insert_batch()` pre-allocates storage for efficient batch loading
+- **O(1) ID lookup** — `HashMap`-backed external-to-internal ID resolution (was O(n) linear scan)
+- **In-place vector update** — `update()` overwrites raw bytes in `O(1)` without rebuilding the graph
+- **Flat adjacency storage** — HNSW graph uses a CSR-like `Vec<u32>` + offsets + counts, eliminating per-node `Vec` heap allocations and 50% edge memory savings vs `Vec<Vec<Vec<usize>>>`
 
 ## Usage
 
@@ -55,19 +59,27 @@ if let Some(vec) = index.get(42) {
 use vivid_index::FlatIndex;
 
 // Create a new index file from existing data
-let index = FlatIndex::create("vectors.bin", 768, &[1, 2], &[vec![0.5; 768], vec![0.1; 768]]).unwrap();
+let mut index = FlatIndex::create("vectors.bin", 768, &[1, 2], &[vec![0.5; 768], vec![0.1; 768]]).unwrap();
 
 // Open an existing file
 let index = FlatIndex::open("vectors.bin").unwrap();
 
 let results = index.search(&[0.1; 768], 5).unwrap();
+
+// FlatIndex now supports full CRUD (insert, update, remove, get, contains)
+index.insert(42, vec![0.3; 768]).unwrap();
+index.update(1, vec![0.9; 768]).unwrap();
+index.remove(2).unwrap();
 ```
 
 ### CLI
 
+Index type is auto-detected from file magic bytes (`VIDH` → HNSW, `VIDV` → Flat). All mutation commands (insert, update, delete, upsert) work with both index types.
+
 ```bash
-# Create an empty index
+# Create an empty index (default: HNSW, use -t flat for exact search)
 vivid-cli create -i my_index.bin -d 768
+vivid-cli create -i my_flat.bin -d 768 -t flat
 
 # Insert a vector (fails on duplicate ID)
 vivid-cli insert -i my_index.bin -n 1 -v "[0.1, 0.2, 0.3]"
@@ -81,25 +93,31 @@ vivid-cli delete -i my_index.bin -n 1
 # Lookup a vector by ID
 vivid-cli get -i my_index.bin -n 1
 
-# Search nearest neighbours
+# Search nearest neighbours (auto-detects index type from file magic bytes)
 vivid-cli search -i my_index.bin -q "[0.1, 0.2, 0.3]" -k 10
 
-# Upsert (insert or update)
+# Upsert (insert or update — creates HNSW index if file doesn't exist)
 vivid-cli upsert -i my_index.bin -d 768 -n 1 -v "[0.1, 0.2, 0.3]"
+
+# Batch insert from JSON file (fails if any ID already exists)
+vivid-cli batch-insert -i my_index.bin -f batch.json
+# batch.json: [[1, [0.1, 0.2, 0.3]], [2, [0.4, 0.5, 0.6]]]
 
 # Index statistics
 vivid-cli info -i my_index.bin
 ```
 
 | Flag | Long | Purpose |
-|---|---|---|
+|---|---|---|---|
 | `-i` | `--index` | Path to index file |
 | `-d` | `--dimension` | Vector dimension |
 | `-n` | `--id` | Vector numeric ID |
 | `-v` | `--vector` | Vector as JSON array |
 | `-q` | `--query` | Query vector as JSON array |
 | `-k` | `--top-k` | Number of results |
-| `-f` | `--force` | Overwrite existing file |
+| `-t` | `--type` | Index type: `hnsw` (default) or `flat` (for `create`) |
+| `-f` | `--file` | Path to JSON file (for `batch-insert`) |
+| `-f` | `--force` | Overwrite existing file (for `create`) |
 
 ### Python
 
@@ -124,6 +142,28 @@ loaded = vivid.PyVividIndex.load_from_file("index.bin")
 cargo build --workspace
 ```
 
+### Release (LTO-optimised)
+
+```bash
+cargo build --release --workspace
+# Release binary: ~674 KB, with LTO, panic=abort, stripped
+```
+
+### Benchmarks
+
+```bash
+# Distance metrics (vivid-core)
+cargo bench -p vivid-core
+
+# Distance metrics with SIMD (nightly)
+cargo bench -p vivid-core --features nightly
+
+# Index operations (vivid-index — insert, search, update, batch, flat search)
+cargo bench -p vivid-index
+
+# HTML reports available at target/criterion/report/
+```
+
 ### Nightly (SIMD acceleration — auto-detects lane width)
 
 Requires `rustup toolchain install nightly`.
@@ -135,11 +175,15 @@ cargo build --features nightly
 ### Override SIMD lane width
 
 ```bash
-# Force 16 lanes (AVX-512 class)
-cargo build --features nightly,simd-lanes-16
-
 # Force 4 lanes (SSE class)
 cargo build --features nightly,simd-lanes-4
+```
+
+### CLI Integration Tests
+
+```powershell
+# Run full CLI test suite (48 tests across both HNSW and Flat index types)
+.\local-tests\run_cli_tests.ps1
 ```
 
 ### Python bindings
@@ -157,7 +201,7 @@ python test.py
 
 ### FlatIndex
 
-File-backed brute-force O(n) exact search. Read-only after creation — use `FlatIndex::create()` to build from existing data.
+File-backed brute-force O(n) exact search. Supports full CRUD after creation (insert, update, remove, get, contains, create, open, save_to_file).
 
 Best for:
 - Datasets < 100K vectors
@@ -166,7 +210,7 @@ Best for:
 
 ### HnswIndex
 
-Incremental Hierarchical Navigable Small World graph — O(log n) approximate search with `insert()`, `remove()`, `update()`, `get()`, and `insert_batch()`.
+Incremental Hierarchical Navigable Small World graph — O(log n) approximate search with `insert()`, `remove()`, `update()`, `get()`, and `insert_batch()`. `update()` overwrites vector data in-place (`O(1)`) without rebuilding graph connections.
 
 Best for:
 - Datasets > 100K vectors
@@ -180,10 +224,10 @@ Best for:
 
 ## Distance Metrics
 
-| Metric | Struct | SIMD (nightly) |
-|---|---|---|
-| Euclidean (L2) | `L2Space` | ✅ `l2_distance_simd` (~270 ns / 1536-dim) |
-| Cosine | `CosineSpace` | ✅ `cosine_distance_simd` (~400 ns / 1536-dim) |
+| Metric | Struct | Stable | Nightly SIMD | Speedup |
+|---|---|---|---|---|
+| Euclidean (L2) | `L2Space` | ~1.89 µs | ~498 ns | ~3.8× |
+| Cosine | `CosineSpace` | ~1.93 µs | ~503 ns | ~3.8× |
 
 ## File Format
 
@@ -212,11 +256,13 @@ Both index types use a combined binary format optimised for zero-copy access:
 ```
 vivid/
 ├── .cargo/config.toml          # Strict linting: deny unsafe, clippy pedantic, missing docs
+├── local-tests/                # CLI integration test script (PowerShell)
 ├── crates/
 │   ├── vivid-core/             # Vector math, distance metrics, SIMD engine
 │   │   ├── src/simd.rs         # Manual SIMD (std::simd, nightly only)
 │   │   └── benches/            # Criterion benchmarks
 │   ├── vivid-index/            # FlatIndex, HnswIndex, persistence
+│   │   ├── benches/            # Criterion benchmarks (insert/search/update/batch)
 │   │   └── src/hnsw.rs         # HNSW graph algorithm + file format
 │   ├── vivid-cli/              # CLI (clap)
 │   └── vivid-python/           # PyO3 Python bindings
@@ -225,10 +271,29 @@ vivid/
 
 ## Performance
 
-Benchmarked with Criterion on 1536-dimensional vectors (nightly SIMD):
+### Distance Metrics (1536-dim, nightly SIMD)
 
 | Operation | Time |
 |---|---|
-| Cosine distance | ~400 ns |
-| L2 distance | ~270 ns |
-| HNSW search (top-5, 200 vectors) | ~5-15 µs |
+| Cosine distance | ~503 ns (~3.8× vs stable iterators) |
+| L2 distance | ~498 ns (~3.8× vs stable iterators) |
+
+### Index Operations (128-dim, release build)
+
+All benchmarks measured via Criterion on 128-dimensional random vectors.
+
+| Operation | Scale | Time |
+|---|---|---|
+| **HNSW insert** | 100 vectors | 18.6 ms (186 µs/vec) |
+| | 500 vectors | 195 ms (390 µs/vec) |
+| **HNSW batch insert** | 100 vectors | 20.2 ms |
+| | 500 vectors | 198 ms |
+| **HNSW search** (top-10) | 100 vectors | 94 µs |
+| | 1,000 vectors | 278 µs |
+| | 5,000 vectors | 590 µs |
+| **HNSW update** (in-place) | 1,000 vectors | **118 ns** |
+| **FlatIndex search** (brute-force, top-10) | 100 vectors | 44 µs |
+| | 1,000 vectors | 202 µs |
+| | 5,000 vectors | 588 µs |
+
+HNSW update is a constant-time memcpy (~118 ns at 128-dim), independent of index size. HNSW search scales sub-linearly with vector count but requires larger datasets (>100K) to fully exploit logarithmic advantages over brute-force FlatIndex.

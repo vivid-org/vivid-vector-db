@@ -5,7 +5,7 @@
 //!  Hierarchical Navigable Small World graphs" by Malkov & Yashunin (2016).
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 
@@ -24,6 +24,117 @@ const VIDH_MAGIC: [u8; 4] = *b"VIDH";
 
 const fn align_up(n: usize, align: usize) -> usize {
     (n + align - 1) & !(align - 1)
+}
+
+/// Flat-packed adjacency layer for HNSW.
+///
+/// Stores all neighbor relationships in a single `Vec<u32>` with per-node
+/// offsets and counts, eliminating per-node `Vec` heap allocations and
+/// capacity slack. Node indices use `u32` (up to ~4B nodes).
+#[derive(Serialize, Deserialize, Clone)]
+struct AdjLayer {
+    /// Flat array of all neighbor IDs in this layer.
+    neighbors: Vec<u32>,
+    /// Start index in `neighbors` for each node's neighbor list.
+    offsets: Vec<u32>,
+    /// Neighbor count per node. Length = `offsets.len()`.
+    /// Node i's neighbors: `neighbors[offsets[i]..offsets[i] + counts[i] as u32]`
+    counts: Vec<u16>,
+}
+
+impl AdjLayer {
+    /// Creates a new layer with `num_nodes` empty neighbor lists.
+    fn with_nodes(num_nodes: usize) -> Self {
+        Self {
+            neighbors: Vec::new(),
+            offsets: vec![0; num_nodes],
+            counts: vec![0; num_nodes],
+        }
+    }
+
+    /// Returns the neighbors of `node` as a slice.
+    fn nbrs(&self, node: usize) -> &[u32] {
+        let start = self.offsets[node] as usize;
+        let end = start + self.counts[node] as usize;
+        &self.neighbors[start..end]
+    }
+
+    /// Adds a neighbor to `node`'s neighbor list.
+    fn add_nbr(&mut self, node: usize, nbr: u32) {
+        let insert = self.offsets[node] as usize + self.counts[node] as usize;
+        self.neighbors.insert(insert, nbr);
+        self.counts[node] += 1;
+        for o in &mut self.offsets[node + 1..] {
+            *o += 1;
+        }
+    }
+
+    /// Replaces the neighbor list of `node` with `new_nbrs`.
+    fn set_nbrs(&mut self, node: usize, new_nbrs: &[u32]) {
+        let start = self.offsets[node] as usize;
+        let old_count = self.counts[node] as usize;
+        let delta = new_nbrs.len() as i64 - old_count as i64;
+
+        self.neighbors.splice(start..start + old_count, new_nbrs.iter().copied());
+        self.counts[node] = new_nbrs.len() as u16;
+
+        if delta != 0 {
+            for o in &mut self.offsets[node + 1..] {
+                *o = (*o as i64 + delta) as u32;
+            }
+        }
+    }
+
+    /// Appends an empty neighbor list for a new node.
+    fn push_empty(&mut self) {
+        let end = match (self.offsets.last(), self.counts.last()) {
+            (Some(&off), Some(&cnt)) => off + cnt as u32,
+            _ => 0,
+        };
+        self.offsets.push(end);
+        self.counts.push(0);
+    }
+
+    /// Removes node at `pos` and decrements all neighbor references > `pos`.
+    /// O(E) where E = total edges in this layer.
+    fn remove_node(&mut self, pos: usize) {
+        // Collect all (adjusted_src, adjusted_target) edges except those involving `pos`.
+        let mut edges: Vec<(usize, u32)> = Vec::with_capacity(self.neighbors.len());
+        for src in 0..self.counts.len() {
+            if src == pos {
+                continue;
+            }
+            let start = self.offsets[src] as usize;
+            let end = start + self.counts[src] as usize;
+            let adjusted_src = if src > pos { src - 1 } else { src };
+            for &tgt in &self.neighbors[start..end] {
+                if tgt != pos as u32 {
+                    let adjusted_tgt = if tgt > pos as u32 { tgt - 1 } else { tgt };
+                    edges.push((adjusted_src, adjusted_tgt));
+                }
+            }
+        }
+
+        let num_nodes = self.counts.len() - 1;
+        let mut new_offsets = Vec::with_capacity(num_nodes);
+        let mut new_counts = Vec::with_capacity(num_nodes);
+        let mut new_neighbors = Vec::with_capacity(edges.len());
+
+        for src in 0..num_nodes {
+            new_offsets.push(new_neighbors.len() as u32);
+            let cnt = edges.iter().filter(|(s, _)| *s == src).count();
+            new_counts.push(cnt as u16);
+            for (s, t) in &edges {
+                if *s == src {
+                    new_neighbors.push(*t);
+                }
+            }
+        }
+
+        self.offsets = new_offsets;
+        self.counts = new_counts;
+        self.neighbors = new_neighbors;
+    }
 }
 
 /// A candidate node with its distance to a query vector.
@@ -65,7 +176,7 @@ struct GraphData {
     ml: f32,
     ids: Vec<VectorId>,
     levels: Vec<usize>,
-    adjacency: Vec<Vec<Vec<usize>>>,
+    adjacency: Vec<AdjLayer>,
     max_layer: usize,
     entry_point: Option<usize>,
 }
@@ -90,7 +201,8 @@ pub struct HnswIndex {
     ml: f32,
     vector_data: Vec<u8>,
     ids: Vec<VectorId>,
-    adjacency: Vec<Vec<Vec<usize>>>,
+    id_to_node: HashMap<VectorId, usize>,
+    adjacency: Vec<AdjLayer>,
     levels: Vec<usize>,
     max_layer: usize,
     entry_point: Option<usize>,
@@ -119,6 +231,7 @@ impl HnswIndex {
             ml: 1.0 / (m as f32).ln(),
             vector_data: Vec::new(),
             ids: Vec::new(),
+            id_to_node: HashMap::new(),
             adjacency: Vec::new(),
             levels: Vec::new(),
             max_layer: 0,
@@ -136,7 +249,7 @@ impl HnswIndex {
 
     /// Returns the internal node index for a given external ID.
     fn node_id_by_id(&self, id: VectorId) -> Option<usize> {
-        self.ids.iter().position(|&x| x == id)
+        self.id_to_node.get(&id).copied()
     }
 
     /// Returns `true` if the index contains the given ID.
@@ -178,18 +291,15 @@ impl HnswIndex {
         let vec_bytes: &[u8] = cast_slice(vector.as_slice());
         self.vector_data.extend_from_slice(vec_bytes);
         self.ids.push(id);
+        self.id_to_node.insert(id, node_id);
         self.levels.push(new_level);
 
         for layer in &mut self.adjacency {
-            layer.push(Vec::new());
+            layer.push_empty();
         }
 
         while self.adjacency.len() <= new_level {
-            let mut layer = Vec::with_capacity(self.ids.len());
-            for _ in 0..self.ids.len() {
-                layer.push(Vec::new());
-            }
-            self.adjacency.push(layer);
+            self.adjacency.push(AdjLayer::with_nodes(self.ids.len()));
         }
 
         if self.entry_point.is_none() {
@@ -218,33 +328,34 @@ impl HnswIndex {
             let neighbors = Self::select_neighbors_simple(&candidates, m_curr);
 
             for &neighbor in &neighbors {
-                self.adjacency[level][node_id].push(neighbor);
+                self.adjacency[level].add_nbr(node_id, neighbor as u32);
             }
 
             for &neighbor in &neighbors {
-                self.adjacency[level][neighbor].push(node_id);
+                self.adjacency[level].add_nbr(neighbor, node_id as u32);
             }
 
             for &neighbor in &neighbors {
                 let limit = if level == 0 { self.m_max } else { self.m };
-                if self.adjacency[level][neighbor].len() > limit {
-                    let new_adj = {
+                if self.adjacency[level].counts[neighbor] as usize > limit {
+                    let new_nbrs = {
                         let node_vec = self.vector_at(neighbor);
-                        let mut cand: Vec<Candidate> = self.adjacency[level][neighbor]
+                        let mut cand: Vec<Candidate> = self.adjacency[level]
+                            .nbrs(neighbor)
                             .iter()
                             .map(|&n| {
-                                let dist = CosineSpace::distance(node_vec, self.vector_at(n))
+                                let dist = CosineSpace::distance(node_vec, self.vector_at(n as usize))
                                     .expect("vectors share the same dimension");
-                                Candidate { node_id: n, distance: dist }
+                                Candidate { node_id: n as usize, distance: dist }
                             })
                             .collect();
                         cand.sort_unstable_by(|a, b| {
                             a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal)
                         });
                         cand.truncate(limit);
-                        cand.into_iter().map(|c| c.node_id).collect::<Vec<_>>()
+                        cand.into_iter().map(|c| c.node_id as u32).collect::<Vec<_>>()
                     };
-                    self.adjacency[level][neighbor] = new_adj;
+                    self.adjacency[level].set_nbrs(neighbor, &new_nbrs);
                 }
             }
 
@@ -301,30 +412,41 @@ impl HnswIndex {
         self.levels.remove(pos);
 
         for layer in &mut self.adjacency {
-            layer.remove(pos);
-            for neighbors in layer.iter_mut() {
-                neighbors.retain(|&n| n != pos);
-                for n in neighbors.iter_mut() {
-                    if *n > pos {
-                        *n -= 1;
-                    }
-                }
-            }
+            layer.remove_node(pos);
         }
 
         self.fix_entry_point_after_removal(pos);
 
+        self.id_to_node = self.ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+
         Ok(())
     }
 
-    /// Replaces the vector for an existing ID (delete + re-insert).
+    /// Replaces the vector for an existing ID in-place (graph structure is preserved).
+    ///
+    /// Only the raw vector bytes in `vector_data` are overwritten — the graph
+    /// topology (neighbor lists) is left unchanged. This is O(1) and avoids the
+    /// cost of tearing down and rebuilding graph connections.
     ///
     /// # Errors
     ///
     /// Returns [`IndexError::IdNotFound`] if the ID is not present.
     pub fn update(&mut self, id: VectorId, vector: Vec<f32>) -> Result<(), IndexError> {
-        self.remove(id)?;
-        self.insert(id, vector)
+        let pos = self.node_id_by_id(id).ok_or(IndexError::IdNotFound(id))?;
+        if vector.is_empty() {
+            return Err(IndexError::EmptyVector);
+        }
+        if vector.len() != self.dimension {
+            return Err(IndexError::DimensionMismatch {
+                expected: self.dimension,
+                found: vector.len(),
+            });
+        }
+
+        let byte_start = pos * self.dimension * 4;
+        let bytes = cast_slice(vector.as_slice());
+        self.vector_data[byte_start..byte_start + bytes.len()].copy_from_slice(bytes);
+        Ok(())
     }
 
     fn fix_entry_point_after_removal(&mut self, removed_pos: usize) {
@@ -400,18 +522,19 @@ impl HnswIndex {
                 break;
             }
 
-            for &neighbor in &self.adjacency[layer][c.node_id] {
-                if visited.insert(neighbor) {
-                    let dist = CosineSpace::distance(query, self.vector_at(neighbor))?;
+            for &neighbor in self.adjacency[layer].nbrs(c.node_id) {
+                let nb = neighbor as usize;
+                if visited.insert(nb) {
+                    let dist = CosineSpace::distance(query, self.vector_at(nb))?;
 
                     if result.len() < ef {
-                        let cand = Candidate { node_id: neighbor, distance: dist };
+                        let cand = Candidate { node_id: nb, distance: dist };
                         candidates.push(Reverse(cand.clone()));
                         result.push(cand);
                     } else {
                         let furthest = result.peek().ok_or(VectorError::EmptyVector)?;
                         if dist < furthest.distance {
-                            let cand = Candidate { node_id: neighbor, distance: dist };
+                            let cand = Candidate { node_id: nb, distance: dist };
                             candidates.push(Reverse(cand.clone()));
                             result.push(cand);
                             result.pop();
@@ -509,6 +632,8 @@ impl HnswIndex {
 
         let vector_data = data[vector_data_start..vector_data_start + expected_vec_bytes].to_vec();
 
+        let id_to_node = graph.ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+
         Ok(Self {
             dimension: graph.dimension,
             m: graph.m,
@@ -517,6 +642,7 @@ impl HnswIndex {
             ml: graph.ml,
             vector_data,
             ids: graph.ids,
+            id_to_node,
             levels: graph.levels,
             adjacency: graph.adjacency,
             max_layer: graph.max_layer,

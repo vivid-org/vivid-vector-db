@@ -17,3 +17,10 @@ bytemuck = "1"
 nightly = ["vivid-core/nightly"]
 simd-lanes-16 = ["vivid-core/simd-lanes-16"]
 simd-lanes-4 = ["vivid-core/simd-lanes-4"]
+
+[[bench]]
+name = "index_bench"
+harness = false
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }

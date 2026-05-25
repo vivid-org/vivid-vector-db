@@ -100,3 +100,88 @@ pub fn cosine_distance_simd(a: &[f32], b: &[f32]) -> f32 {
     let cosine_similarity = dot / (norm_a.sqrt() * norm_b.sqrt());
     1.0 - cosine_similarity
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scalar_l2(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b.iter()).map(|(&x, &y)| { let d = x - y; d * d }).sum::<f32>().sqrt()
+    }
+
+    fn scalar_cosine(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f32 = a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum();
+        let na: f32 = a.iter().map(|&x| x * x).sum();
+        let nb: f32 = b.iter().map(|&x| x * x).sum();
+        if na == 0.0 || nb == 0.0 { return 1.0; }
+        1.0 - dot / (na.sqrt() * nb.sqrt())
+    }
+
+    #[test]
+    fn test_simd_l2_matches_scalar() {
+        for dim in [1, 2, 3, 4, 7, 8, 15, 16, 17, 32, 64, 100] {
+            let a: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.1).collect();
+            let b: Vec<f32> = (0..dim).map(|i| 1.0 + (i as f32) * 0.05).collect();
+            let expected = scalar_l2(&a, &b);
+            let got = l2_distance_simd(&a, &b);
+            assert!((got - expected).abs() < 1e-5, "dim={}: expected {} got {}", dim, expected, got);
+        }
+    }
+
+    #[test]
+    fn test_simd_cosine_matches_scalar() {
+        for dim in [1, 2, 3, 4, 7, 8, 15, 16, 17, 32, 64, 100] {
+            let a: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.1).collect();
+            let b: Vec<f32> = (0..dim).map(|i| 1.0 + (i as f32) * 0.05).collect();
+            let expected = scalar_cosine(&a, &b);
+            let got = cosine_distance_simd(&a, &b);
+            assert!((got - expected).abs() < 1e-5, "dim={}: expected {} got {}", dim, expected, got);
+        }
+    }
+
+    #[test]
+    fn test_simd_l2_tail_handling() {
+        let a = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let b = vec![5.0, 4.0, 3.0, 2.0, 1.0];
+        let expected = scalar_l2(&a, &b);
+        let got = l2_distance_simd(&a, &b);
+        assert!((got - expected).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_simd_cosine_tail_handling() {
+        let a = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let b = vec![5.0, 4.0, 3.0, 2.0, 1.0];
+        let expected = scalar_cosine(&a, &b);
+        let got = cosine_distance_simd(&a, &b);
+        assert!((got - expected).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_simd_l2_identity() {
+        let a = vec![3.0, 1.0, 4.0, 1.5, 9.0, 2.6];
+        assert_eq!(l2_distance_simd(&a, &a), 0.0);
+    }
+
+    #[test]
+    fn test_simd_cosine_identity() {
+        let a = vec![3.0, 1.0, 4.0, 1.5, 9.0, 2.6];
+        assert_eq!(cosine_distance_simd(&a, &a), 0.0);
+    }
+
+    #[test]
+    fn test_simd_l2_symmetry() {
+        let a: Vec<f32> = (0..20).map(|i| (i as f32) * 0.3).collect();
+        let b: Vec<f32> = (0..20).map(|i| 10.0 - (i as f32) * 0.2).collect();
+        assert!((l2_distance_simd(&a, &b) - l2_distance_simd(&b, &a)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_simd_cosine_zero_vector() {
+        let a = vec![0.0, 0.0, 0.0];
+        let b = vec![1.0, 2.0, 3.0];
+        assert_eq!(cosine_distance_simd(&a, &b), 1.0);
+        assert_eq!(cosine_distance_simd(&b, &a), 1.0);
+        assert_eq!(cosine_distance_simd(&a, &a), 1.0);
+    }
+}

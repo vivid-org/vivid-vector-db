@@ -176,9 +176,139 @@ impl FlatIndex {
             })
             .collect::<Result<Vec<_>, VectorError>>()?;
 
-        results.sort_unstable_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
+        results.sort_unstable_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(top_k);
         Ok(results)
+    }
+
+    /// Returns the vector dimension of the index.
+    #[must_use]
+    pub fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    /// Returns `true` if the index contains the given ID.
+    #[must_use]
+    pub fn contains(&self, id: VectorId) -> bool {
+        let ids_start = FLAT_HEADER;
+        for i in 0..self.num_vectors {
+            let ns = ids_start + i * 8;
+            let stored_id = u64::from_le_bytes(self.data[ns..ns + 8].try_into().unwrap());
+            if stored_id == id {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Retrieves the vector associated with the given ID by linear scan.
+    #[must_use]
+    pub fn get(&self, id: VectorId) -> Option<&[f32]> {
+        let ids_start = FLAT_HEADER;
+        for i in 0..self.num_vectors {
+            let ns = ids_start + i * 8;
+            let stored_id = u64::from_le_bytes(self.data[ns..ns + 8].try_into().ok()?);
+            if stored_id == id {
+                let vs = ids_start + self.num_vectors * 8 + i * self.dimension * 4;
+                let ve = vs + self.dimension * 4;
+                return Some(cast_slice(&self.data[vs..ve]));
+            }
+        }
+        None
+    }
+
+    /// Inserts a new vector.
+    ///
+    /// The ID is spliced into the ID block (before the vector block) and the
+    /// vector data is appended at the end.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError::DuplicateId`] if the ID already exists.
+    pub fn insert(&mut self, id: VectorId, vector: Vec<f32>) -> Result<(), IndexError> {
+        if self.contains(id) {
+            return Err(IndexError::DuplicateId(id));
+        }
+        if vector.is_empty() {
+            return Err(IndexError::EmptyVector);
+        }
+        if vector.len() != self.dimension {
+            return Err(IndexError::DimensionMismatch {
+                expected: self.dimension,
+                found: vector.len(),
+            });
+        }
+
+        let id_insert = FLAT_HEADER + self.num_vectors * 8;
+        self.data.splice(id_insert..id_insert, id.to_le_bytes());
+        self.data.extend_from_slice(cast_slice(vector.as_slice()));
+        self.num_vectors += 1;
+        self.update_header_count();
+        Ok(())
+    }
+
+    /// Replaces the vector for an existing ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError::IdNotFound`] if the ID is not present.
+    pub fn update(&mut self, id: VectorId, vector: Vec<f32>) -> Result<(), IndexError> {
+        if vector.len() != self.dimension {
+            return Err(IndexError::DimensionMismatch {
+                expected: self.dimension,
+                found: vector.len(),
+            });
+        }
+        let ids_start = FLAT_HEADER;
+        for i in 0..self.num_vectors {
+            let ns = ids_start + i * 8;
+            let stored_id = u64::from_le_bytes(self.data[ns..ns + 8].try_into().unwrap());
+            if stored_id == id {
+                let vs = ids_start + self.num_vectors * 8 + i * self.dimension * 4;
+                let bytes = cast_slice(vector.as_slice());
+                self.data[vs..vs + bytes.len()].copy_from_slice(bytes);
+                return Ok(());
+            }
+        }
+        Err(IndexError::IdNotFound(id))
+    }
+
+    /// Removes a vector by ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError::IdNotFound`] if the ID is not present.
+    pub fn remove(&mut self, id: VectorId) -> Result<(), IndexError> {
+        let ids_start = FLAT_HEADER;
+        for i in 0..self.num_vectors {
+            let ns = ids_start + i * 8;
+            let stored_id = u64::from_le_bytes(self.data[ns..ns + 8].try_into().unwrap());
+            if stored_id == id {
+                // Remove the ID entry (8 bytes at ns).
+                self.data.splice(ns..ns + 8, []);
+                // After ID removal, the vector section start shifted left by 8.
+                let vec_byte_len = self.dimension * 4;
+                let vec_section = ids_start + (self.num_vectors - 1) * 8;
+                let vec_start = vec_section + i * vec_byte_len;
+                self.data.splice(vec_start..vec_start + vec_byte_len, []);
+                self.num_vectors -= 1;
+                self.update_header_count();
+                return Ok(());
+            }
+        }
+        Err(IndexError::IdNotFound(id))
+    }
+
+    /// Writes the current index state to a file.
+    pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), IndexError> {
+        std::fs::write(path.as_ref(), &self.data)?;
+        Ok(())
+    }
+
+    /// Rewrites the num_vectors field in the header.
+    fn update_header_count(&mut self) {
+        let bytes = (self.num_vectors as u64).to_le_bytes();
+        self.data[8..16].copy_from_slice(&bytes);
     }
 
     /// Returns the total number of indexed vectors.
@@ -198,10 +328,18 @@ impl FlatIndex {
 mod tests {
     use super::*;
 
+    fn flat_path(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir();
+        let p = dir.join(name);
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    // ── existing tests ──
+
     #[test]
     fn test_flat_index_search() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("vivid_flat_test.bin");
+        let path = flat_path("vivid_flat_test.bin");
 
         let ids = vec![101u64, 102, 103];
         let vectors = vec![
@@ -224,8 +362,7 @@ mod tests {
 
     #[test]
     fn test_flat_index_persistence() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("vivid_flat_persist.bin");
+        let path = flat_path("vivid_flat_persist.bin");
 
         let ids = vec![42u64, 99];
         let vectors = vec![vec![0.1, 0.9], vec![0.8, 0.2]];
@@ -239,6 +376,192 @@ mod tests {
         let a = created.search(&query, 1).unwrap();
         let b = loaded.search(&query, 1).unwrap();
         assert_eq!(a, b);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── new insertion tests ──
+
+    #[test]
+    fn test_flat_insert_and_get() {
+        let path = flat_path("vivid_flat_insert_get.bin");
+        let mut index = FlatIndex::create(&path, 3, &[], &[]).unwrap();
+        assert!(index.is_empty());
+
+        index.insert(42, vec![1.0, 2.0, 3.0]).unwrap();
+        assert!(!index.is_empty());
+        assert_eq!(index.len(), 1);
+        assert!(index.contains(42));
+        assert!(!index.contains(99));
+
+        let vec = index.get(42);
+        assert!(vec.is_some());
+        assert_eq!(vec.unwrap(), &[1.0, 2.0, 3.0]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_flat_insert_multiple() {
+        let path = flat_path("vivid_flat_insert_multi.bin");
+        let mut index = FlatIndex::create(&path, 2, &[], &[]).unwrap();
+
+        for id in 0..10 {
+            index.insert(id, vec![id as f32, (id * 2) as f32]).unwrap();
+        }
+        assert_eq!(index.len(), 10);
+
+        for id in 0..10 {
+            let v = index.get(id).unwrap();
+            assert_eq!(v[0], id as f32);
+            assert_eq!(v[1], (id * 2) as f32);
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_flat_insert_duplicate_rejected() {
+        let path = flat_path("vivid_flat_insert_dup.bin");
+        let mut index = FlatIndex::create(&path, 2, &[], &[]).unwrap();
+
+        index.insert(1, vec![0.1, 0.2]).unwrap();
+        let err = index.insert(1, vec![0.3, 0.4]).unwrap_err();
+        assert_eq!(err, IndexError::DuplicateId(1));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_flat_insert_empty_vector() {
+        let path = flat_path("vivid_flat_insert_empty.bin");
+        let mut index = FlatIndex::create(&path, 3, &[], &[]).unwrap();
+
+        let err = index.insert(1, vec![]).unwrap_err();
+        assert_eq!(err, IndexError::EmptyVector);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_flat_insert_dimension_mismatch() {
+        let path = flat_path("vivid_flat_insert_dim.bin");
+        let mut index = FlatIndex::create(&path, 3, &[], &[]).unwrap();
+
+        let err = index.insert(1, vec![0.1, 0.2]).unwrap_err();
+        assert_eq!(
+            err,
+            IndexError::DimensionMismatch { expected: 3, found: 2 }
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── new removal tests ──
+
+    #[test]
+    fn test_flat_remove() {
+        let path = flat_path("vivid_flat_remove.bin");
+        let mut index = FlatIndex::create(&path, 2, &[1, 2, 3], &[vec![0.0; 2], vec![1.0; 2], vec![2.0; 2]]).unwrap();
+
+        assert_eq!(index.len(), 3);
+        index.remove(2).unwrap();
+        assert_eq!(index.len(), 2);
+        assert!(!index.contains(2));
+        assert!(index.contains(1));
+        assert!(index.contains(3));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_flat_remove_nonexistent() {
+        let path = flat_path("vivid_flat_remove_nope.bin");
+        let mut index = FlatIndex::create(&path, 1, &[1], &[vec![0.0]]).unwrap();
+
+        let err = index.remove(999).unwrap_err();
+        assert_eq!(err, IndexError::IdNotFound(999));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_flat_remove_last_vector() {
+        let path = flat_path("vivid_flat_remove_last.bin");
+        let mut index = FlatIndex::create(&path, 1, &[1], &[vec![0.0]]).unwrap();
+
+        assert!(!index.is_empty());
+        index.remove(1).unwrap();
+        assert!(index.is_empty());
+        assert_eq!(index.len(), 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── new update tests ──
+
+    #[test]
+    fn test_flat_update() {
+        let path = flat_path("vivid_flat_update.bin");
+        let mut index = FlatIndex::create(&path, 3, &[10], &[vec![0.0; 3]]).unwrap();
+
+        index.update(10, vec![9.0, 8.0, 7.0]).unwrap();
+        assert_eq!(index.get(10).unwrap(), &[9.0, 8.0, 7.0]);
+        assert_eq!(index.len(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_flat_update_nonexistent() {
+        let path = flat_path("vivid_flat_update_nope.bin");
+        let mut index = FlatIndex::create(&path, 1, &[], &[]).unwrap();
+
+        let err = index.update(42, vec![1.0]).unwrap_err();
+        assert_eq!(err, IndexError::IdNotFound(42));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── new get tests ──
+
+    #[test]
+    fn test_flat_get_nonexistent() {
+        let path = flat_path("vivid_flat_get_nope.bin");
+        let index = FlatIndex::create(&path, 2, &[1], &[vec![1.0; 2]]).unwrap();
+
+        assert!(index.get(999).is_none());
+        assert!(index.get(1).is_some());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── new save-to-file round-trip ──
+
+    #[test]
+    fn test_flat_save_to_file_roundtrip() {
+        let path = flat_path("vivid_flat_roundtrip.bin");
+        let mut index = FlatIndex::create(&path, 3, &[], &[]).unwrap();
+
+        index.insert(1, vec![1.0, 2.0, 3.0]).unwrap();
+        index.insert(2, vec![4.0, 5.0, 6.0]).unwrap();
+        index.save_to_file(&path).unwrap();
+
+        let loaded = FlatIndex::open(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.get(1).unwrap(), &[1.0, 2.0, 3.0]);
+        assert_eq!(loaded.get(2).unwrap(), &[4.0, 5.0, 6.0]);
+
+        // Mutate and re-save
+        let mut loaded = loaded;
+        loaded.remove(1).unwrap();
+        loaded.insert(3, vec![7.0, 8.0, 9.0]).unwrap();
+        loaded.save_to_file(&path).unwrap();
+
+        let reloaded = FlatIndex::open(&path).unwrap();
+        assert_eq!(reloaded.len(), 2);
+        assert!(reloaded.get(1).is_none());
+        assert_eq!(reloaded.get(3).unwrap(), &[7.0, 8.0, 9.0]);
 
         let _ = std::fs::remove_file(&path);
     }
